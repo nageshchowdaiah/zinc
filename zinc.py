@@ -1518,7 +1518,6 @@ class Manifest(object):
     if verbose:
       if self.changelist is not None:
         out.append("changes: %s\n" % self.changelist.to_summary(sep=", ").rstrip(", "))
-      # out.append("items: %s\n" % " ".join([item.path for item in self.items]))
     return "".join(out)
 
   def get_paths(self):
@@ -2081,8 +2080,6 @@ class Repo(object):
     '''
     with self.scope_lock(scope):
       tip_rev = self.get_tip(scope)
-      if prev_rev != tip_rev:
-        raise InvalidOperation("working directory (%s) is out of date with new tip (%s) for scope '%s' (must update and re-commit)" % (prev_rev, tip_rev, scope))
       prev_mf = self.get_manifest(scope, prev_rev)
       return self._commit_items(scope, local_dir, prev_mf.items, changelist, user, message, time=time)
 
@@ -2653,7 +2650,6 @@ def changelist_for_fingerprints(old_fingerprints, new_fingerprints, fill_md5s=Tr
   checks and mark all files as modified.
   '''
   changelist = Changelist()
-
   if lazy_md5s and not root_path:
     raise InvalidOperation("root_path required to compute MD5s")
 
@@ -2850,11 +2846,10 @@ class WorkingDir(object):
     if not self.checkout_state.has_scope(scope):
       raise InvalidArgument("scope is not checked out: '%s'" % scope)
     old_fingerprints = self.checkout_state.for_subdir(scope)
-    
+
     file_list = self._walk_files(scope, force_mode=force_mode, print_untracked=print_untracked)
     local_scope_path = join_path(self.work_dir, scope)
     new_fingerprints = FingerprintList.of_files(local_scope_path, file_list, compute_md5=compute_md5)
-
     return (old_fingerprints, new_fingerprints)
 
   @log_calls
@@ -2876,10 +2871,8 @@ class WorkingDir(object):
     delete all rms in changelist, or delete only rms that are listed in items.
     '''
     # Apply changes. First adds and modifies.
-    items_to_fetch = []
-    for item in items:
-      if item.path in changelist.mod_paths or item.path in changelist.add_paths:
-        items_to_fetch.append(item)
+    # fetch all the items from the local directory to check the modification with given revision
+    items_to_fetch = items
     local_scope_path = join_path(self.work_dir, scope)
     new_fingerprints = self.repo.fetch_items(scope, items_to_fetch, local_scope_path, clobber=True, backup_suffix=backup_suffix)
     # Now deletes. (It's nice to do these last just in case we abort earlier.)
@@ -3191,30 +3184,27 @@ class WorkingDir(object):
       _do_print_diff(path, path)
 
   @log_calls
-  def revert(self, scope, path_list=None, backup_suffix=BACKUP_SUFFIX):
-    '''Revert specified files in working directory to original state. If path_list is empty or None, revert all files.'''
+  def revert(self, scope, path_list=None, rev=None, backup_suffix=BACKUP_SUFFIX):
+    '''Revert specified files in working directory to original state. If path_list is empty or None, revert all files. initial state of rev is taken to decide the updation of new_fingerprints'''
+    state=rev
     full_revert = not path_list
-    rev = self.get_checkout_rev(scope)
+    '''computed the revision only if rev is not specified else rev is taken'''
+    rev = self.get_checkout_rev(scope) if rev == None else rev
     mf = self.repo.get_manifest(scope, rev)
     local_scope_dir = join_path(self.work_dir, scope)
-
     # Pick all items unless we have a list
     items = mf.get_items(path_list) if path_list else mf.items
     if None in items:
       raise InvalidArgument("item not found in rev %s of scope '%s': %s" % (rev, scope, path_list[items.index(None)]))
-
     # Get changelist needed to revert, and update files
     (old_fingerprints, new_fingerprints) = self._fingerprint_status(scope, compute_md5=False)
+    
     changelist = changelist_for_fingerprints(new_fingerprints, old_fingerprints, lazy_md5s=True, root_path=local_scope_dir)
-
-    # TODO support reverting to a differetn revision: compute changelist for update,
-    # and compose with changelist for working dir revert
-
     # Revert command will only delete explicitly listed items, unless we are doing a full revert.
     new_fingerprints = self._update_local_files(scope, items, changelist, delete_items=True, delete_all=full_revert, backup_suffix=BACKUP_SUFFIX)
-
-    # Update checkout states to reflect new mtimes, so hashes aren't recomputed later
-    self.checkout_state.update_fingerprints(scope, new_fingerprints)
+    # Update checkout states to reflect new mtimes for immediate revert, so hashes aren't recomputed later
+    if state==None:
+      self.checkout_state.update_fingerprints(scope, new_fingerprints)
     self._write_checkout_state()
 
   @log_calls
@@ -3222,9 +3212,6 @@ class WorkingDir(object):
     '''Commit current changes to the repository.'''
     repo_tip = self.repo.get_tip(scope)
     prev_rev = self.repo.resolve_rev(scope, self.get_checkout_rev(scope))
-    if prev_rev != repo_tip:
-      raise InvalidOperation("repository (rev %s) is ahead of working directory (rev %s) for scope '%s': try update first" \
-        % (repo_tip, prev_rev, scope))
 
     local_scope_dir = join_path(self.work_dir, scope)
     (old_fingerprints, new_fingerprints) = self._fingerprint_status(scope, compute_md5=False)
@@ -3652,7 +3639,8 @@ def run_command(command, command_args, options):
         if options.all:
           raise InvalidOperation("revert --all doesn't make much sense; try commit --work instead")
         elif options.rev:
-          raise NotImplementedError("sorry, revert to specified revision not yet implemented")
+          require_opt(command, "scope", options)
+          work.revert(options.scope, path_list=command_args, rev=options.rev)
         elif options.work:
           checkouts = work.checkouts()
           if len(command_args) > 0:
@@ -3661,7 +3649,6 @@ def run_command(command, command_args, options):
             log.info("reverting scope '%s'", checkout.scope)
             work.revert(checkout.scope)
         else:
-          # TODO support revert to specified revision
           require_opt(command, "scope", options)
           work.revert(options.scope, path_list=command_args)
       elif command in ["track", "untrack"]:
